@@ -63,15 +63,17 @@ python pretrain.py \
     --n_timesteps 256 \
     --embedding_dim 512 \
     --use_laplacian \
-    --laplacian_lambda 0.01 \
-    --laplacian_top_k 10 \
-    --use_gradient_mixing \
+    --laplacian_lambda 0.001 \
+    --laplacian_top_k 12 \
+    --laplacian_warmup_epochs 10 \
     --temporal_pool attention \
     --batch_size 32 \
     --epochs 100 \
     --lr 1e-3 \
     --save_dir checkpoints/pretrain
 ```
+
+**Note**: `--use_gradient_mixing` is disabled during pretraining to prevent spatial shortcuts. Use it during finetuning instead.
 
 **Example with custom data (`.pklz` format):**
 
@@ -90,10 +92,11 @@ python pretrain.py \
 **Key Arguments:**
 - `--train_data`: Path to `.npz` or `.pklz` file (uses `data_train_window` or `data` key)
 - `--temporal_pool`: Pooling method - `mean` (default) or `attention` (preserves temporal info)
-- `--use_laplacian`: Enable Laplacian smoothing regularization
-- `--laplacian_lambda`: Weight for Laplacian regularization (default: 0.01)
-- `--laplacian_top_k`: Top-k connections per ROI (default: 10)
-- `--use_gradient_mixing`: Enable gradient-aware ROI mixing
+- `--use_laplacian`: Enable mask-aware Laplacian smoothing
+- `--laplacian_lambda`: Weight for Laplacian regularization (recommended: 0.0001-0.001)
+- `--laplacian_top_k`: Top-k connections per ROI (recommended: 8-16)
+- `--laplacian_warmup_epochs`: Warmup λ from 0→target over N epochs (default: 10)
+- `--use_gradient_mixing`: Enable for finetuning (auto-disabled during masked pretraining)
 
 ### 2. Finetuning
 
@@ -375,30 +378,42 @@ python test.py ... --device auto  # or 'gpu' or 'cpu'
 
 Attention pooling preserves temporal dynamics and provides interpretable attention weights showing which brain states matter for the task.
 
-### Laplacian Smoothing
+### Laplacian Smoothing (Mask-Aware)
 
 1. **Build adjacency matrix** from functional connectivity:
    - Compute correlation matrices across subjects
    - Average to get group-level FC
-   - Keep top-k connections per ROI
+   - Keep top-k connections per ROI (recommended: k=8-16)
 
 2. **Compute Laplacian**: `L = I - D^(-1/2) A D^(-1/2)`
 
-3. **Add regularization**: `λ * tr(H^T L H)`
+3. **Add mask-aware regularization**: `λ * tr(H_ctx^T L H_ctx)`
+   - **Mask-aware**: Only computed on **unmasked (context) positions** during pretraining
+   - Prevents spatial shortcuts where masked tokens could be inferred from neighbors
    - Applied to hidden representations at layer 2
-   - Encourages smooth activations across connected ROIs
+   - **Lambda warmup**: Gradually increases from 0→λ over first 10 epochs
+   - Encourages smooth activations across connected ROIs without over-smoothing
 
-### Gradient-Aware Mixing
+**Recommended tuning**:
+- `--laplacian_lambda`: 1e-4 to 1e-3 (start with 0.001)
+- `--laplacian_top_k`: 8 to 16 neighbors
+- `--laplacian_warmup_epochs`: 5 to 10 epochs
+
+### Gradient-Aware Mixing (with Guardrails)
 
 1. **Compute principal gradients**:
    - Build affinity matrix from FC patterns
    - Apply PCA to get gradient components
    - Sort ROIs by first principal component
 
-2. **Apply mixing**:
+2. **Apply mixing with guardrails**:
    - 2D convolution across ordered ROI dimension
    - MLP gating based on gradient coordinates
-   - Captures hierarchical brain organization
+   - **Pretraining guardrail**: Disabled during masked pretraining to prevent spatial shortcuts
+   - Active during finetuning for hierarchical feature learning
+   - Captures hierarchical brain organization without creating reconstruction shortcuts
+
+**Note**: Gradient mixing is automatically disabled during pretraining when masks are present to prevent same-time spatial leakage. Enable only for finetuning or use time-block masking.
 
 ## Data Preparation
 

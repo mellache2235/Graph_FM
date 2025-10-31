@@ -18,7 +18,7 @@ from utils import (
 )
 
 
-def pretrain_epoch(model, dataloader, optimizer, device):
+def pretrain_epoch(model, dataloader, optimizer, device, lambda_scale=1.0):
     model.train()
     total_recon_loss = total_lap_loss = total_loss = n_batches = 0
     
@@ -31,7 +31,7 @@ def pretrain_epoch(model, dataloader, optimizer, device):
         reconstruction, _ = model(x_masked, mask=mask)
         
         recon_loss = reconstruction_loss(reconstruction, x, mask, loss_type='mse')
-        lap_loss = model.compute_laplacian_regularization()
+        lap_loss = model.compute_laplacian_regularization(lambda_scale=lambda_scale)
         loss = recon_loss + lap_loss
         
         optimizer.zero_grad()
@@ -50,7 +50,7 @@ def pretrain_epoch(model, dataloader, optimizer, device):
     }
 
 
-def validate_pretrain(model, dataloader, device):
+def validate_pretrain(model, dataloader, device, lambda_scale=1.0):
     model.eval()
     total_recon_loss = total_lap_loss = total_loss = n_batches = 0
     
@@ -64,7 +64,7 @@ def validate_pretrain(model, dataloader, device):
             reconstruction, _ = model(x_masked, mask=mask)
             
             recon_loss = reconstruction_loss(reconstruction, x, mask, loss_type='mse')
-            lap_loss = model.compute_laplacian_regularization()
+            lap_loss = model.compute_laplacian_regularization(lambda_scale=lambda_scale)
             loss = recon_loss + lap_loss
             
             total_recon_loss += recon_loss.item()
@@ -89,6 +89,7 @@ def main():
     parser.add_argument('--use_laplacian', action='store_true')
     parser.add_argument('--laplacian_lambda', type=float, default=0.01)
     parser.add_argument('--laplacian_top_k', type=int, default=10)
+    parser.add_argument('--laplacian_warmup_epochs', type=int, default=10)
     parser.add_argument('--use_gradient_mixing', action='store_true')
     parser.add_argument('--temporal_pool', type=str, default='mean', choices=['mean', 'attention'])
     parser.add_argument('--batch_size', type=int, default=32)
@@ -131,11 +132,17 @@ def main():
     
     best_val_loss = float('inf')
     for epoch in range(1, args.epochs + 1):
-        train_metrics = pretrain_epoch(model, train_loader, optimizer, args.device)
-        print(f"Epoch {epoch}: Train Loss: {train_metrics['total_loss']:.4f}")
+        # Lambda warmup: 0 → 1 over warmup_epochs to prevent over-smoothing early on
+        if args.use_laplacian and args.laplacian_warmup_epochs > 0:
+            lambda_scale = min(1.0, epoch / args.laplacian_warmup_epochs)
+        else:
+            lambda_scale = 1.0
+        
+        train_metrics = pretrain_epoch(model, train_loader, optimizer, args.device, lambda_scale=lambda_scale)
+        print(f"Epoch {epoch}: Train Loss: {train_metrics['total_loss']:.4f} (λ_scale: {lambda_scale:.3f})")
         
         if val_loader:
-            val_metrics = validate_pretrain(model, val_loader, args.device)
+            val_metrics = validate_pretrain(model, val_loader, args.device, lambda_scale=lambda_scale)
             print(f"Epoch {epoch}: Val Loss: {val_metrics['total_loss']:.4f}")
             if val_metrics['total_loss'] < best_val_loss:
                 best_val_loss = val_metrics['total_loss']

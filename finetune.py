@@ -25,7 +25,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
         
         logits, _ = model(x)
         cls_loss = criterion(logits, y)
-        lap_loss = model.compute_laplacian_regularization()
+        lap_loss = model.compute_laplacian_regularization(lambda_scale=1.0)
         loss = cls_loss + lap_loss
         
         optimizer.zero_grad()
@@ -75,7 +75,7 @@ def validate(model, dataloader, criterion, device, return_predictions=False):
             logits, _ = model(x)
             
             cls_loss = criterion(logits, y)
-            lap_loss = model.compute_laplacian_regularization()
+            lap_loss = model.compute_laplacian_regularization(lambda_scale=1.0)
             loss = cls_loss + lap_loss
             
             probs = torch.softmax(logits, dim=1)

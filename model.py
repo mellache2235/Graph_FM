@@ -102,18 +102,28 @@ class CNN1D_fMRI(nn.Module):
     def set_gradient_coords(self, coords: torch.Tensor):
         self.gradient_coords = coords
     
-    def apply_gradient_mixing(self, x: torch.Tensor) -> torch.Tensor:
-        # Gradient-aware mixing: reorder ROIs by principal gradient, apply 2D conv, then gate with MLP
+    def apply_gradient_mixing(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Gradient-aware mixing with mask guardrails to prevent pretraining shortcuts
         if not self.use_gradient_mixing:
             return x
         
-        batch, channels, rois = x.shape
+        batch, channels, timesteps = x.shape
         
+        # During pretraining with masking, apply guardrails to prevent spatial shortcuts
+        if self.mode == 'pretrain' and mask is not None:
+            # Mask-gated mixing: zero out features at masked positions before mixing
+            # Transpose to (batch, channels, timesteps) -> (batch, timesteps, channels)
+            # But x is already (batch, channels, timesteps) after conv
+            # We need to prevent same-time spatial leakage
+            # For now, skip gradient mixing during pretraining with masks
+            return x
+        
+        # Apply gradient mixing for finetuning or pretraining without masks
         if self.roi_order is not None:
             x_ordered = x[:, :, self.roi_order]
-            x_2d = x_ordered.view(batch * channels, 1, rois, 1)
+            x_2d = x_ordered.view(batch * channels, 1, timesteps, 1)
             x_mixed = self.grad_mix_conv(x_2d)
-            x_mixed = x_mixed.view(batch, channels, rois)
+            x_mixed = x_mixed.view(batch, channels, timesteps)
             x_mixed = x_mixed[:, :, torch.argsort(self.roi_order)]
         else:
             x_mixed = x
@@ -137,10 +147,13 @@ class CNN1D_fMRI(nn.Module):
             x = layer(x)
             
             if self.use_gradient_mixing and i < 2:
-                x = self.apply_gradient_mixing(x)
+                x = self.apply_gradient_mixing(x, mask)
             
             if self.use_laplacian and i == self.laplacian_layer:
                 self.hidden_maps['laplacian_layer'] = x
+                # Store mask for mask-aware Laplacian regularization
+                if mask is not None:
+                    self.hidden_maps['mask'] = mask
             
             if i < len(self.encoder_layers) - 1:
                 x = F.relu(x)
@@ -171,26 +184,41 @@ class CNN1D_fMRI(nn.Module):
             logits = self.classifier(embedding)
             return logits, self.hidden_maps
     
-    def compute_laplacian_regularization(self) -> torch.Tensor:
+    def compute_laplacian_regularization(self, lambda_scale: float = 1.0) -> torch.Tensor:
         # Laplacian smoothing: λ * tr(H^T L H) where H is hidden activations and L is graph Laplacian
-        # Applied at specified layer to enforce smoothness across connected ROIs
+        # MASK-AWARE: Only compute on unmasked positions to prevent spatial shortcuts during pretraining
+        # lambda_scale: warmup multiplier (0→1 over first few epochs)
         if not self.use_laplacian or self.L is None or 'laplacian_layer' not in self.hidden_maps:
             return torch.tensor(0.0, device=next(self.parameters()).device)
         
-        H = self.hidden_maps['laplacian_layer']
+        H = self.hidden_maps['laplacian_layer']  # (batch, channels, timesteps)
+        mask = self.hidden_maps.get('mask', None)  # (batch, timesteps) if present
         batch, channels, timesteps = H.shape
-        H_avg = H.mean(dim=2)
         
-        if channels == self.n_rois:
-            reg_loss = 0
-            for i in range(batch):
-                H_i = H_avg[i:i+1]
-                reg_loss += torch.trace(H_i.T @ self.L @ H_i)
-            reg_loss = reg_loss / batch
+        if channels != self.n_rois:
+            return torch.tensor(0.0, device=H.device)
+        
+        # Transpose to (batch, timesteps, n_rois) for easier processing
+        H_bt = H.transpose(1, 2)  # (batch, timesteps, n_rois)
+        
+        if mask is not None:
+            # MASK-AWARE REGULARIZATION: Only penalize on unmasked (context) positions
+            # mask: 1 = masked, 0 = keep
+            ctx = (1 - mask).float().unsqueeze(-1)  # (batch, timesteps, 1), 1 = context
+            H_ctx = H_bt * ctx  # Zero out masked positions
+            
+            # Compute smoothness only on context: tr(H_ctx^T L H_ctx)
+            # H_ctx: (batch, timesteps, n_rois), L: (n_rois, n_rois)
+            # smooth = sum_b,t H_ctx[b,t,:] @ L @ H_ctx[b,t,:]
+            smooth = torch.einsum('btn,nm,btm->', H_ctx, self.L, H_ctx)
+            ctx_count = ctx.sum() + 1e-8
+            reg_loss = smooth / ctx_count
         else:
-            reg_loss = torch.tensor(0.0, device=H.device)
+            # No mask: average over all timesteps
+            smooth = torch.einsum('btn,nm,btm->', H_bt, self.L, H_bt)
+            reg_loss = smooth / (batch * timesteps)
         
-        return self.laplacian_lambda * reg_loss
+        return self.laplacian_lambda * lambda_scale * reg_loss
     
     def load_pretrained_encoder(self, pretrained_path: str, freeze: bool = True):
         checkpoint = torch.load(pretrained_path, map_location='cpu')
