@@ -65,10 +65,20 @@ def compute_graph_laplacian(adj: np.ndarray, normalized: bool = True) -> np.ndar
     return L
 
 
-def compute_principal_gradient(timeseries_data: np.ndarray, n_components: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+def compute_principal_gradient(timeseries_data: np.ndarray, n_components: int = 3, max_subjects_for_fc: int = 500) -> Tuple[np.ndarray, np.ndarray]:
+    # Gradient computation: subsample to max_subjects_for_fc to reduce computational cost
+    # For 10,000+ windowed samples, using 200-500 subjects is sufficient for stable gradient estimates
     from sklearn.decomposition import PCA
     n_subjects, n_timesteps, n_rois = timeseries_data.shape
     
+    # Subsample if needed
+    if n_subjects > max_subjects_for_fc:
+        print(f"Subsampling {max_subjects_for_fc} from {n_subjects} samples for gradient computation")
+        indices = np.random.choice(n_subjects, max_subjects_for_fc, replace=False)
+        timeseries_data = timeseries_data[indices]
+        n_subjects = max_subjects_for_fc
+    
+    # Compute group-level FC (this is the expensive part)
     fc_matrices = []
     for subj in range(n_subjects):
         fc_matrices.append(np.corrcoef(timeseries_data[subj].T))

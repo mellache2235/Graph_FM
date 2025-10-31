@@ -96,6 +96,7 @@ python pretrain.py \
 - `--laplacian_lambda`: Weight for Laplacian regularization (recommended: 0.0001-0.001)
 - `--laplacian_top_k`: Top-k connections per ROI (recommended: 8-16)
 - `--laplacian_warmup_epochs`: Warmup λ from 0→target over N epochs (default: 10)
+- `--max_subjects_graph`: Max samples for FC/gradient computation (default: 200; for 10K+ windowed samples)
 - `--use_gradient_mixing`: Enable for finetuning (auto-disabled during masked pretraining)
 
 ### 2. Finetuning
@@ -494,13 +495,32 @@ The implementation enforces that maximum LR doesn't exceed 1e-3 (the pretraining
 
 ## Performance Tips
 
+### For Large Windowed Datasets (10K+ samples)
+
+When using sliding window augmentation that creates 10,000+ samples from timeseries:
+
+1. **Graph Computation is O(1)**: FC and gradient computation happens **once at startup**, not during training
+2. **Subsample for FC/Gradients**: Use `--max_subjects_graph 200` 
+   - FC computation: O(n_subjects × n_rois²)
+   - For 10K subjects: ~2-3 minutes
+   - For 200 subjects: ~5-10 seconds
+   - Gradient estimates are stable with just 200-500 samples
+
+3. **Recommended settings**:
+```bash
+# For 10,000+ windowed samples
+--max_subjects_graph 200  # Use 200 samples for FC/gradient computation
+--laplacian_top_k 12      # Modest k to keep graph sparse
+--batch_size 64           # Larger batch since you have many samples
+```
+
+### General Tips
+
 1. **Use PyTorch Lightning**: Automatic GPU acceleration, mixed precision, and better performance
 2. **TR Resampling**: Linear interpolation is fast and effective; cubic may be better for smooth data
-3. **Laplacian Computation**: Use `max_subjects=500` to limit memory usage for large datasets
-4. **Gradient Mixing**: Compute gradients once per dataset and reuse across splits
-5. **Data Loading**: Use `--num_workers 4` or more for faster data loading
-6. **Mixed Precision**: PyTorch Lightning supports `precision='16-mixed'` for 2x speedup
-7. **Batch Size**: Use largest batch size that fits in GPU memory (typically 32-64)
+3. **Batch Size**: Use largest batch size that fits in GPU memory (typically 32-64)
+4. **Gradient Mixing**: Disabled during pretraining (prevents shortcuts); enable for finetuning
+5. **Cache Laplacian/Gradients**: Compute once, save with `torch.save()`, load in future runs
 
 ## Citation
 

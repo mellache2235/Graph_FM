@@ -90,6 +90,7 @@ def main():
     parser.add_argument('--laplacian_lambda', type=float, default=0.01)
     parser.add_argument('--laplacian_top_k', type=int, default=10)
     parser.add_argument('--laplacian_warmup_epochs', type=int, default=10)
+    parser.add_argument('--max_subjects_graph', type=int, default=200, help='Max subjects for graph computation')
     parser.add_argument('--use_gradient_mixing', action='store_true')
     parser.add_argument('--temporal_pool', type=str, default='mean', choices=['mean', 'attention'])
     parser.add_argument('--batch_size', type=int, default=32)
@@ -117,13 +118,13 @@ def main():
     ).to(args.device)
     
     if args.use_laplacian:
-        train_data = load_data_for_laplacian(args.train_data, max_subjects=500)
+        train_data = load_data_for_laplacian(args.train_data, max_subjects=args.max_subjects_graph)
         L = build_laplacian_from_data(train_data, top_k=args.laplacian_top_k, normalized=True, device=args.device)
         model.set_laplacian(L)
     
     if args.use_gradient_mixing:
-        train_data = load_data_for_gradients(args.train_data, max_subjects=500)
-        gradient_coords, roi_order = compute_principal_gradient(train_data, n_components=3)
+        train_data = load_data_for_gradients(args.train_data, max_subjects=args.max_subjects_graph)
+        gradient_coords, roi_order = compute_principal_gradient(train_data, n_components=3, max_subjects_for_fc=args.max_subjects_graph)
         model.set_roi_order(torch.from_numpy(roi_order).long().to(args.device))
         model.set_gradient_coords(torch.from_numpy(gradient_coords).float().to(args.device))
     
