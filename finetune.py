@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
 from typing import Optional
@@ -14,23 +15,34 @@ from data_loader import create_data_loader, load_data_for_laplacian, load_data_f
 from utils import build_laplacian_from_data, compute_principal_gradient
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None, use_amp=False, scaler=None):
     model.train()
     total_loss = total_lap_loss = n_batches = 0
     all_preds, all_labels, all_probs = [], [], []
     
     for batch_data in tqdm(dataloader, desc="Training"):
         x, y = batch_data[:2]
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         
-        logits, _ = model(x)
-        cls_loss = criterion(logits, y)
-        lap_loss = model.compute_laplacian_regularization(lambda_scale=1.0)
-        loss = cls_loss + lap_loss
+        optimizer.zero_grad(set_to_none=True)
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if use_amp and scaler is not None:
+            with autocast(device_type='cuda', dtype=torch.float16):
+                logits, _ = model(x)
+                cls_loss = criterion(logits, y)
+                lap_loss = model.compute_laplacian_regularization(lambda_scale=1.0)
+                loss = cls_loss + lap_loss
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits, _ = model(x)
+            cls_loss = criterion(logits, y)
+            lap_loss = model.compute_laplacian_regularization(lambda_scale=1.0)
+            loss = cls_loss + lap_loss
+            loss.backward()
+            optimizer.step()
         
         if scheduler:
             scheduler.step()
@@ -131,6 +143,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--save_dir', type=str, default='checkpoints_finetune')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision')
+    parser.add_argument('--compile', action='store_true', help='Compile model with torch.compile')
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
@@ -154,6 +168,10 @@ def main():
         temporal_pool=args.temporal_pool
     ).to(args.device)
     
+    if args.compile and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+    
     if args.pretrained_model:
         pretrained_state = torch.load(args.pretrained_model, map_location=args.device)
         model_dict = model.state_dict()
@@ -175,12 +193,15 @@ def main():
         model.set_gradient_coords(torch.from_numpy(gradient_coords).float().to(args.device))
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, fused=torch.cuda.is_available())
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    
+    scaler = GradScaler('cuda') if args.use_amp and args.device == 'cuda' else None
     
     best_val_acc = 0.0
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, args.device)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, args.device, 
+                                   use_amp=args.use_amp, scaler=scaler)
         print(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
         
         if val_loader:

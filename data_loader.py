@@ -323,7 +323,8 @@ def create_data_loader(
         dataset = fMRIDataset(data_path, transform=transform, load_ids=load_ids,
                             source_tr=source_tr, target_tr=target_tr, interp_kind=interp_kind)
     
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, 
+                     pin_memory=True, persistent_workers=num_workers > 0, prefetch_factor=2 if num_workers > 0 else None)
 
 
 def load_data_for_laplacian(data_path: str, max_subjects: Optional[int] = None) -> np.ndarray:

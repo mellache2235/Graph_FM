@@ -185,9 +185,8 @@ class CNN1D_fMRI(nn.Module):
             return logits, self.hidden_maps
     
     def compute_laplacian_regularization(self, lambda_scale: float = 1.0) -> torch.Tensor:
-        # Laplacian smoothing: λ * tr(H^T L H) where H is hidden activations and L is graph Laplacian
-        # MASK-AWARE: Only compute on unmasked positions to prevent spatial shortcuts during pretraining
-        # lambda_scale: warmup multiplier (0→1 over first few epochs)
+        # Laplacian smoothing: λ * tr(H^T L H) - fully vectorized for GPU efficiency
+        # MASK-AWARE: Only compute on unmasked positions to prevent spatial shortcuts
         if not self.use_laplacian or self.L is None or 'laplacian_layer' not in self.hidden_maps:
             return torch.tensor(0.0, device=next(self.parameters()).device)
         
@@ -198,23 +197,17 @@ class CNN1D_fMRI(nn.Module):
         if channels != self.n_rois:
             return torch.tensor(0.0, device=H.device)
         
-        # Transpose to (batch, timesteps, n_rois) for easier processing
         H_bt = H.transpose(1, 2)  # (batch, timesteps, n_rois)
         
         if mask is not None:
-            # MASK-AWARE REGULARIZATION: Only penalize on unmasked (context) positions
-            # mask: 1 = masked, 0 = keep
-            ctx = (1 - mask).float().unsqueeze(-1)  # (batch, timesteps, 1), 1 = context
-            H_ctx = H_bt * ctx  # Zero out masked positions
-            
-            # Compute smoothness only on context: tr(H_ctx^T L H_ctx)
-            # H_ctx: (batch, timesteps, n_rois), L: (n_rois, n_rois)
-            # smooth = sum_b,t H_ctx[b,t,:] @ L @ H_ctx[b,t,:]
+            # MASK-AWARE: Zero out masked positions
+            ctx = (1 - mask).float().unsqueeze(-1)  # (batch, timesteps, 1)
+            H_ctx = H_bt * ctx
+            # Fully vectorized computation using einsum (GPU-efficient)
             smooth = torch.einsum('btn,nm,btm->', H_ctx, self.L, H_ctx)
-            ctx_count = ctx.sum() + 1e-8
-            reg_loss = smooth / ctx_count
+            reg_loss = smooth / (ctx.sum() + 1e-8)
         else:
-            # No mask: average over all timesteps
+            # Vectorized without mask
             smooth = torch.einsum('btn,nm,btm->', H_bt, self.L, H_bt)
             reg_loss = smooth / (batch * timesteps)
         

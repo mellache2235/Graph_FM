@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from model import CNN1D_fMRI
@@ -18,25 +19,36 @@ from utils import (
 )
 
 
-def pretrain_epoch(model, dataloader, optimizer, device, lambda_scale=1.0):
+def pretrain_epoch(model, dataloader, optimizer, device, lambda_scale=1.0, use_amp=False, scaler=None):
     model.train()
     total_recon_loss = total_lap_loss = total_loss = n_batches = 0
     
     for batch_data in tqdm(dataloader, desc="Pretraining"):
-        x = batch_data.to(device)
+        x = batch_data.to(device, non_blocking=True)
         batch_size, n_timesteps, _ = x.shape
         
         mask = create_random_interval_mask(batch_size, n_timesteps, mask_ratio=0.25, min_interval_len=5, max_interval_len=20, device=device)
         x_masked = apply_mask_to_timeseries(x, mask, mask_value=0.0)
-        reconstruction, _ = model(x_masked, mask=mask)
         
-        recon_loss = reconstruction_loss(reconstruction, x, mask, loss_type='mse')
-        lap_loss = model.compute_laplacian_regularization(lambda_scale=lambda_scale)
-        loss = recon_loss + lap_loss
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if use_amp and scaler is not None:
+            with autocast(device_type='cuda', dtype=torch.float16):
+                reconstruction, _ = model(x_masked, mask=mask)
+                recon_loss = reconstruction_loss(reconstruction, x, mask, loss_type='mse')
+                lap_loss = model.compute_laplacian_regularization(lambda_scale=lambda_scale)
+                loss = recon_loss + lap_loss
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            reconstruction, _ = model(x_masked, mask=mask)
+            recon_loss = reconstruction_loss(reconstruction, x, mask, loss_type='mse')
+            lap_loss = model.compute_laplacian_regularization(lambda_scale=lambda_scale)
+            loss = recon_loss + lap_loss
+            loss.backward()
+            optimizer.step()
         
         total_recon_loss += recon_loss.item()
         total_lap_loss += lap_loss.item()
@@ -98,6 +110,8 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--use_amp', action='store_true', help='Use automatic mixed precision (faster on GPU)')
+    parser.add_argument('--compile', action='store_true', help='Compile model with torch.compile (PyTorch 2.0+)')
     args = parser.parse_args()
     
     os.makedirs(args.save_dir, exist_ok=True)
@@ -117,6 +131,11 @@ def main():
         temporal_pool=args.temporal_pool
     ).to(args.device)
     
+    # Compile model for faster execution (PyTorch 2.0+)
+    if args.compile and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+    
     if args.use_laplacian:
         train_data = load_data_for_laplacian(args.train_data, max_subjects=args.max_subjects_graph)
         L = build_laplacian_from_data(train_data, top_k=args.laplacian_top_k, normalized=True, device=args.device)
@@ -128,18 +147,22 @@ def main():
         model.set_roi_order(torch.from_numpy(roi_order).long().to(args.device))
         model.set_gradient_coords(torch.from_numpy(gradient_coords).float().to(args.device))
     
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    # Use fused optimizer for faster GPU training
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, fused=torch.cuda.is_available())
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    
+    # Setup AMP scaler for mixed precision
+    scaler = GradScaler('cuda') if args.use_amp and args.device == 'cuda' else None
     
     best_val_loss = float('inf')
     for epoch in range(1, args.epochs + 1):
-        # Lambda warmup: 0 → 1 over warmup_epochs to prevent over-smoothing early on
         if args.use_laplacian and args.laplacian_warmup_epochs > 0:
             lambda_scale = min(1.0, epoch / args.laplacian_warmup_epochs)
         else:
             lambda_scale = 1.0
         
-        train_metrics = pretrain_epoch(model, train_loader, optimizer, args.device, lambda_scale=lambda_scale)
+        train_metrics = pretrain_epoch(model, train_loader, optimizer, args.device, 
+                                      lambda_scale=lambda_scale, use_amp=args.use_amp, scaler=scaler)
         print(f"Epoch {epoch}: Train Loss: {train_metrics['total_loss']:.4f} (λ_scale: {lambda_scale:.3f})")
         
         if val_loader:
