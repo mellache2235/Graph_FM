@@ -24,11 +24,16 @@ Two complementary approaches:
 - Captures hierarchical organization of brain networks
 
 ### Data Format
-- Input: `.pklz` (gzipped pickle) files
-- Supports:
-  - Dictionary: `{'X': data, 'Y': labels, 'ids': subject_ids}`
-  - Tuple: `(X, Y)` or `(X, Y, ids)`
-- Automatic reshaping from `(n_subjects, n_channels, n_timesteps)` to `(n_subjects, n_timesteps, n_channels)`
+- **Supported Formats**: `.npz` (NumPy compressed) or `.pklz` (gzipped pickle)
+- **Automatic Key Detection**:
+  - **Pretrain Data**: `data_train_window`, `data`, `Data`, `X`
+  - **Labels**: `label`, `Label`, `labels`, `labels_train_window`
+  - **TR**: `tr` (automatically extracted if present)
+  - **IDs**: `ids`, `id`, `subject_ids`
+- **Data Cleaning**:
+  - Automatic NaN removal
+  - Variable-length timeseries equalization (padding/truncation)
+  - Automatic reshaping from `(n_subjects, n_rois, n_timesteps)` to `(n_subjects, n_timesteps, n_rois)`
 
 ## Installation
 
@@ -49,62 +54,89 @@ The implementation supports both PyTorch and PyTorch Lightning. **PyTorch Lightn
 
 ### 1. Pretraining
 
+**Example with HCP/NKI data (`.npz` format):**
+
 ```bash
 python pretrain.py \
-    --train_data data/pretrain_train.pklz \
-    --val_data data/pretrain_val.pklz \
+    --train_data /path/to/hcp_nki_gender_window_256_64.npz \
     --n_rois 246 \
-    --n_timesteps 200 \
+    --n_timesteps 256 \
     --embedding_dim 512 \
     --use_laplacian \
     --laplacian_lambda 0.01 \
     --laplacian_top_k 10 \
     --use_gradient_mixing \
-    --mask_ratio 0.25 \
-    --min_interval 5 \
-    --max_interval 20 \
+    --temporal_pool attention \
     --batch_size 32 \
     --epochs 100 \
     --lr 1e-3 \
     --save_dir checkpoints/pretrain
 ```
 
+**Example with custom data (`.pklz` format):**
+
+```bash
+python pretrain.py \
+    --train_data data/pretrain_train.pklz \
+    --val_data data/pretrain_val.pklz \
+    --n_rois 246 \
+    --n_timesteps 200 \
+    --temporal_pool mean \
+    --batch_size 32 \
+    --epochs 100 \
+    --save_dir checkpoints/pretrain
+```
+
 **Key Arguments:**
-- `--mask_ratio`: Proportion of timesteps to mask (default: 0.25)
-- `--min_interval`, `--max_interval`: Range for masked interval lengths
+- `--train_data`: Path to `.npz` or `.pklz` file (uses `data_train_window` or `data` key)
+- `--temporal_pool`: Pooling method - `mean` (default) or `attention` (preserves temporal info)
 - `--use_laplacian`: Enable Laplacian smoothing regularization
-- `--laplacian_lambda`: Weight for Laplacian regularization
-- `--laplacian_top_k`: Number of top connections per ROI in adjacency matrix
+- `--laplacian_lambda`: Weight for Laplacian regularization (default: 0.01)
+- `--laplacian_top_k`: Top-k connections per ROI (default: 10)
 - `--use_gradient_mixing`: Enable gradient-aware ROI mixing
 
 ### 2. Finetuning
 
+**Example with TR resampling (ADHD data at TR=2.0s → pretrain TR=0.72s):**
+
 ```bash
 python finetune.py \
-    --train_data data/finetune_train.pklz \
-    --val_data data/finetune_val.pklz \
-    --test_data data/finetune_test.pklz \
+    --train_data data/adhd_train.npz \
+    --val_data data/adhd_val.npz \
+    --test_data data/adhd_test.npz \
+    --source_tr 2.0 \
+    --target_tr 0.72 \
     --n_rois 246 \
     --n_classes 2 \
-    --embedding_dim 512 \
     --pretrained_model checkpoints/pretrain/best_pretrain_model.pt \
-    --freeze_encoder \
     --use_laplacian \
-    --laplacian_lambda 0.01 \
     --use_gradient_mixing \
+    --temporal_pool attention \
     --batch_size 32 \
     --epochs 50 \
     --lr 1e-4 \
-    --dropout 0.5 \
-    --track_ids \
     --save_dir checkpoints/finetune
+```
+
+**Example with automatic TR extraction (TR stored in data file):**
+
+```bash
+python finetune.py \
+    --train_data data/finetune_train.npz \
+    --val_data data/finetune_val.npz \
+    --target_tr 0.72 \
+    --pretrained_model checkpoints/pretrain/best_pretrain_model.pt \
+    --temporal_pool attention \
+    --epochs 50 \
+    --save_dir checkpoints/finetune
+# TR automatically read from data['tr'] if present
 ```
 
 **Key Arguments:**
 - `--pretrained_model`: Path to pretrained model weights
-- `--freeze_encoder`: Freeze encoder layers (transfer learning)
-- `--track_ids`: Track subject IDs for cross-validation/analysis
-- `--dropout`: Dropout rate before classifier
+- `--source_tr`: Source TR in seconds (e.g., 2.0 for ADHD); auto-detected from `data['tr']` if available
+- `--target_tr`: Target TR to match pretrained model (default: 0.72)
+- `--temporal_pool`: `mean` or `attention` (must match pretraining)
 
 ### 3. Testing on External Datasets
 
@@ -256,33 +288,50 @@ trainer.test(model, test_loader)
 
 ```
 Graph_FM/
-├── model.py                  # Base CNN1D_fMRI model
-├── model_lightning.py        # PyTorch Lightning wrapper (recommended)
-├── data_loader.py            # Data loading utilities for .pklz files
+├── model.py                  # Base CNN1D_fMRI with temporal attention pooling
+├── model_lightning.py        # PyTorch Lightning wrapper
+├── data_loader.py            # Data loading for .npz/.pklz files
 ├── utils.py                  # Graph utilities and TR resampling
-├── pretrain.py               # Pretraining script
-├── finetune.py               # Finetuning script
+├── pretrain.py               # Pretraining script (lean, minimal args)
+├── finetune.py               # Finetuning script (lean, minimal args)
 ├── test.py                   # Test on external datasets
 ├── repeated_evaluation.py    # 50x repeated evaluation protocol
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
-├── example_usage.py          # Usage examples
-└── examples/                 # Additional examples
+└── example_usage.py          # Usage examples
 ```
 
 ## TR Resampling
 
 The implementation handles different TRs (repetition times) automatically:
 
-- **Pretraining**: Typically at TR=0.72s
+- **Pretraining**: HCP/NKI data at TR=0.72s
 - **Finetuning**: May use different datasets (e.g., ADHD at TR=2.0s)
 
-Data is automatically resampled using scipy.interpolate.interp1d:
+### Automatic TR Detection
+
+```bash
+# TR automatically extracted from data['tr'] if present
+python finetune.py --train_data data.npz --target_tr 0.72
+# Prints: "Using TR from data file: 2.0s"
+```
+
+### Manual TR Specification
+
+```bash
+# Explicitly specify source TR
+python finetune.py \
+    --train_data adhd_data.npz \
+    --source_tr 2.0 \
+    --target_tr 0.72
+```
+
+### Programmatic Resampling
 
 ```python
 # Automatic resampling when loading data
 train_loader = create_data_loader(
-    'adhd_data.pklz',
+    'adhd_data.npz',
     source_tr=2.0,      # ADHD data at 2.0s TR
     target_tr=0.72,     # Resample to match pretrained model
     interp_kind='linear'
@@ -312,6 +361,20 @@ python test.py ... --device auto  # or 'gpu' or 'cpu'
 
 ## Key Components
 
+### Temporal Pooling Options
+
+**Mean Pooling (default)**:
+```bash
+--temporal_pool mean  # Simple averaging across time
+```
+
+**Attention Pooling (recommended)**:
+```bash
+--temporal_pool attention  # Learns which timesteps are important
+```
+
+Attention pooling preserves temporal dynamics and provides interpretable attention weights showing which brain states matter for the task.
+
 ### Laplacian Smoothing
 
 1. **Build adjacency matrix** from functional connectivity:
@@ -319,10 +382,10 @@ python test.py ... --device auto  # or 'gpu' or 'cpu'
    - Average to get group-level FC
    - Keep top-k connections per ROI
 
-2. **Compute Laplacian**: L = I - D^(-1/2) A D^(-1/2)
+2. **Compute Laplacian**: `L = I - D^(-1/2) A D^(-1/2)`
 
-3. **Add regularization**: λ * tr(H^T L H)
-   - Applied to hidden representations at specified layer
+3. **Add regularization**: `λ * tr(H^T L H)`
+   - Applied to hidden representations at layer 2
    - Encourages smooth activations across connected ROIs
 
 ### Gradient-Aware Mixing
@@ -335,24 +398,42 @@ python test.py ... --device auto  # or 'gpu' or 'cpu'
 2. **Apply mixing**:
    - 2D convolution across ordered ROI dimension
    - MLP gating based on gradient coordinates
+   - Captures hierarchical brain organization
 
 ## Data Preparation
 
-Your `.pklz` files should contain:
+### Format 1: NumPy Compressed (`.npz`) - Recommended for Pretraining
+
+```python
+import numpy as np
+
+# Pretrain data (HCP/NKI example)
+data_train = np.random.randn(1000, 246, 256)  # (subjects, rois, timesteps)
+labels_train = np.random.randint(0, 2, 1000)  # Optional for pretraining
+
+np.savez_compressed('pretrain_data.npz',
+    data_train_window=data_train,      # Key name matters!
+    labels_train_window=labels_train,  # Optional
+    tr=0.72                             # Optional: TR in seconds
+)
+```
+
+### Format 2: Gzipped Pickle (`.pklz`) - Flexible Format
 
 ```python
 import gzip
 import pickle
 import numpy as np
 
-# Format 1: Dictionary
+# Dictionary format (supports multiple key variations)
 data = {
-    'X': np.random.randn(100, 200, 246),  # (subjects, timesteps, rois)
-    'Y': np.random.randint(0, 2, 100),     # (subjects,)
-    'ids': np.arange(100)                  # (subjects,) - optional
+    'data': np.random.randn(100, 200, 246),  # or 'X', 'Data', 'data_train_window'
+    'label': np.random.randint(0, 2, 100),   # or 'Y', 'labels', 'labels_train_window'
+    'tr': 2.0,                                # Optional: TR in seconds
+    'ids': np.arange(100)                     # Optional: subject IDs
 }
 
-# Format 2: Tuple
+# Tuple format also supported
 data = (X, Y) or (X, Y, ids)
 
 # Save
@@ -360,7 +441,21 @@ with gzip.open('data.pklz', 'wb') as f:
     pickle.dump(data, f)
 ```
 
-**Note**: If your data is in `(subjects, channels, timesteps)` format, it will be automatically reshaped to `(subjects, timesteps, channels)`.
+### Supported Key Variations
+
+The data loader automatically detects:
+- **Data**: `data_train_window`, `data_test_window`, `data`, `Data`, `DATA`, `X`, `x`
+- **Labels**: `labels_train_window`, `labels_test_window`, `label`, `Label`, `labels`, `Y`, `y`
+- **TR**: `tr` (float, in seconds)
+- **IDs**: `ids`, `id`, `subject_ids`, `subjects`
+
+### Automatic Data Cleaning
+
+The loader automatically:
+1. **Removes NaNs**: Filters out samples with NaN in data or labels
+2. **Equalizes lengths**: Pads/truncates variable-length timeseries
+3. **Reshapes**: Converts `(subjects, rois, timesteps)` → `(subjects, timesteps, rois)`
+4. **Extracts TR**: Uses `data['tr']` if `--source_tr` not specified
 
 ## Learning Rate Guidelines
 
